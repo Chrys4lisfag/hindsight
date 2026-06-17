@@ -100,12 +100,40 @@ class GeminiLLM(LLMInterface):
             self._init_gemini()
 
     def _init_gemini(self) -> None:
-        """Initialize Gemini API client."""
+        """Initialize Gemini API client.
+
+        When `HINDSIGHT_API_LLM_BASE_URL` is set (`self.base_url`), pass it
+        as `HttpOptions(base_url=...)` so the google-genai SDK directs
+        traffic at the proxy / gateway instead of the real
+        `generativelanguage.googleapis.com`. Also forwards the API key
+        as an `Authorization: Bearer …` header in addition to the
+        SDK's default `?key=` query param, so proxies expecting bearer
+        auth (e.g. self-hosted gateways issuing `sk-…` keys) succeed
+        without requiring sub2api-side `?key=` support.
+        """
         if not self.api_key:
             raise ValueError("Gemini provider requires api_key")
 
-        self._client = genai.Client(api_key=self.api_key)
-        logger.info(f"Gemini API: model={self.model}")
+        client_kwargs: dict[str, Any] = {"api_key": self.api_key}
+        if self.base_url:
+            try:
+                http_options = genai_types.HttpOptions(
+                    base_url=self.base_url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                )
+                client_kwargs["http_options"] = http_options
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning(
+                    "Gemini API: failed to apply HINDSIGHT_API_LLM_BASE_URL=%s: %s",
+                    self.base_url,
+                    exc,
+                )
+        self._client = genai.Client(**client_kwargs)
+        logger.info(
+            "Gemini API: model=%s base_url=%s",
+            self.model,
+            self.base_url or "default",
+        )
 
     def _apply_service_tier(self, config_kwargs: dict[str, Any]) -> None:
         if not self._service_tier:

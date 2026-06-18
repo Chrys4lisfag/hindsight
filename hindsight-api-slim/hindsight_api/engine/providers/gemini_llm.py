@@ -354,21 +354,74 @@ class GeminiLLM(LLMInterface):
 
                 content = response.text
 
-                # Handle empty response
+                # Handle empty response — capture full diagnostic state so
+                # we can distinguish: (a) empty candidates array, (b) safety
+                # block via prompt_feedback, (c) finish_reason=MAX_TOKENS
+                # mid-thinking, (d) finish_reason=RECITATION, (e) raw text
+                # actually empty with reason=STOP. Without this it's all
+                # "reason: None" and you can't tell which case you're in.
                 if content is None:
                     block_reason = None
+                    cand_count = 0
+                    safety = None
+                    prompt_block = None
+                    raw_text_len = -1
+                    parts_summary: list[str] = []
+                    model_version = getattr(response, "model_version", None)
                     if hasattr(response, "candidates") and response.candidates:
+                        cand_count = len(response.candidates)
                         candidate = response.candidates[0]
                         if hasattr(candidate, "finish_reason"):
                             block_reason = candidate.finish_reason
+                        if hasattr(candidate, "safety_ratings"):
+                            safety = [
+                                f"{r.category}:{r.probability}"
+                                for r in (candidate.safety_ratings or [])
+                            ]
+                        if hasattr(candidate, "content") and candidate.content:
+                            for p in (getattr(candidate.content, "parts", None) or []):
+                                if hasattr(p, "text"):
+                                    t = p.text or ""
+                                    parts_summary.append(f"text[{len(t)}]")
+                                elif hasattr(p, "function_call"):
+                                    parts_summary.append("functionCall")
+                                else:
+                                    parts_summary.append(type(p).__name__)
+                    if hasattr(response, "prompt_feedback") and response.prompt_feedback:
+                        prompt_block = getattr(response.prompt_feedback, "block_reason", None)
+                    usage = getattr(response, "usage_metadata", None)
+                    usage_summary = None
+                    if usage:
+                        usage_summary = (
+                            f"prompt={getattr(usage, 'prompt_token_count', '?')} "
+                            f"cand={getattr(usage, 'candidates_token_count', '?')} "
+                            f"thoughts={getattr(usage, 'thoughts_token_count', '?')} "
+                            f"total={getattr(usage, 'total_token_count', '?')}"
+                        )
+
+                    diag = (
+                        f"finish={block_reason!s} candidates={cand_count} "
+                        f"prompt_block={prompt_block!s} safety={safety!s} "
+                        f"parts={parts_summary!s} model={model_version!s} "
+                        f"usage=({usage_summary})"
+                    )
 
                     if attempt < max_retries:
-                        logger.warning(f"Gemini returned empty response (reason: {block_reason}), retrying...")
+                        logger.warning(
+                            "Gemini empty response (attempt %d/%d, scope=%s): %s",
+                            attempt + 1, max_retries + 1, scope, diag,
+                        )
                         backoff = min(initial_backoff * (2**attempt), max_backoff)
                         await asyncio.sleep(backoff)
                         continue
                     else:
-                        raise RuntimeError(f"Gemini returned empty response after {max_retries + 1} attempts")
+                        logger.error(
+                            "Gemini empty response after %d attempts (scope=%s): %s",
+                            max_retries + 1, scope, diag,
+                        )
+                        raise RuntimeError(
+                            f"Gemini returned empty response after {max_retries + 1} attempts ({diag})"
+                        )
 
                 # Parse structured output if requested
                 if response_format is not None:

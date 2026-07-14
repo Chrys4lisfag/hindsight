@@ -27,7 +27,7 @@ from hindsight_api.engine.audit import (
     AuditLogStatsResponse,
 )
 from hindsight_api.engine.llm_trace import LLMRequestListResponse, LLMRequestStatsResponse
-from hindsight_api.extensions import AuthenticationError
+from hindsight_api.extensions import AuthenticationError, PrecheckOperation
 
 
 def _parse_metadata(metadata: Any) -> dict[str, Any]:
@@ -52,6 +52,7 @@ from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from hindsight_api import MemoryEngine
+from hindsight_api.config import RETAIN_EXTRACTION_MODES
 
 
 def _annotation_is_nullable(annotation: Any) -> bool:
@@ -154,6 +155,8 @@ from hindsight_api.engine.response_models import (
     VALID_RECALL_FACT_TYPES,
     DryRunExtractionResult,
     MemoryFact,
+    MinScores,
+    RecallScores,
     TokenUsage,
 )
 from hindsight_api.engine.search.tags import TagGroup, TagsMatch
@@ -270,6 +273,16 @@ class RecallRequest(BaseModel):
         default=None,
         description="List of fact types to recall: 'world', 'experience', 'observation'. Defaults to world and experience if not specified.",
     )
+    prefer_observations: bool = Field(
+        default=False,
+        description=(
+            "When recalling raw facts ('world'/'experience') together with 'observation', drop any raw "
+            "fact that an observation in the results was consolidated from, so the observation supersedes "
+            "it and you don't get duplicate content. The freed slots are backfilled with the next results, "
+            "keeping the result count at the requested budget. Disabled by default; set to true to enable. "
+            "No effect unless 'observation' and at least one raw type are both requested."
+        ),
+    )
     budget: Budget = Budget.MID
     max_tokens: int = 4096
     trace: bool = False
@@ -286,17 +299,30 @@ class RecallRequest(BaseModel):
     )
     tags: list[str] | None = Field(
         default=None,
-        description="Filter memories by tags. If not specified, all memories are returned.",
+        description="Filter memories by tags. If not specified, all memories are returned. "
+        "Omitting tags (or passing []) together with tags_match='exact' filters to "
+        "untagged/global observations only (the scope written by observation_scopes='shared').",
     )
     tags_match: TagsMatch = Field(
         default="any",
         description="How to match tags: 'any' (OR, includes untagged), 'all' (AND, includes untagged), "
-        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged).",
+        "'any_strict' (OR, excludes untagged), 'all_strict' (AND, excludes untagged), "
+        "'exact' (set-equality on the full scope, excludes untagged). With 'exact' and no tags "
+        "(or []), the empty global scope is selected and only untagged memories match.",
     )
     tag_groups: list[TagGroup] | None = Field(
         default=None,
         description="Compound tag filter using boolean groups. Groups in the list are AND-ed. "
         "Each group is a leaf {tags, match} or compound {and: [...]}, {or: [...]}, {not: ...}.",
+    )
+    min_scores: MinScores | None = Field(
+        default=None,
+        description="Optional per-stage score floors (all inclusive, AND-ed). `semantic` and `keyword` are "
+        "retrieval-level cutoffs pushed into the SQL arms (overriding the global similarity/BM25 minimums for "
+        "this request); `reranker` and `final` are post-ranking filters on the scored results. Any field left "
+        "unset imposes no floor; omitting `min_scores` entirely (the default) applies no score filtering. Use "
+        "with care — the reranker's absolute scores are not calibrated across queries (a clearly-relevant match "
+        "may score ~0.001 even though it is ranked first).",
     )
 
     @field_validator("query")
@@ -353,6 +379,7 @@ class RecallResult(BaseModel):
     source_fact_ids: list[str] | None = (
         None  # IDs of source facts (observation type only, when source_facts is enabled)
     )
+    scores: RecallScores | None = None  # Per-stage recall scores (final/reranker/semantic/text)
 
 
 class EntityObservationResponse(BaseModel):
@@ -1219,7 +1246,7 @@ class CreateBankRequest(BaseModel):
     )
     retain_extraction_mode: str | None = Field(
         default=None,
-        description="Fact extraction mode: 'concise' (default), 'verbose', or 'custom'.",
+        description="Fact extraction mode: 'concise' (default), 'verbose', 'custom', 'verbatim', or 'chunks'.",
     )
     retain_custom_instructions: str | None = Field(
         default=None,
@@ -1407,6 +1434,7 @@ class ListMemoryUnitsResponse(BaseModel):
                         "date": "2024-01-15T10:30:00Z",
                         "type": "world",
                         "entities": "Alice (PERSON), Google (ORGANIZATION)",
+                        "metadata": {"source": "slack", "channel": "engineering"},
                     }
                 ],
                 "total": 150,
@@ -1640,8 +1668,8 @@ class UpdateMemoryRequest(BaseModel):
 
     @model_validator(mode="after")
     def _require_an_edit(self) -> "UpdateMemoryRequest":
-        if all(
-            v is None
+        has_value_edit = any(
+            v is not None
             for v in (
                 self.text,
                 self.context,
@@ -1651,7 +1679,9 @@ class UpdateMemoryRequest(BaseModel):
                 self.entities,
                 self.state,
             )
-        ):
+        )
+        has_date_clear = bool({"occurred_start", "occurred_end"} & self.model_fields_set)
+        if not has_value_edit and not has_date_clear:
             raise ValueError("Provide at least one field to update.")
         if self.state is not None and self.state not in ("valid", "invalidated"):
             raise ValueError("state must be 'valid' or 'invalidated'.")
@@ -1953,6 +1983,17 @@ class MentalModelTrigger(BaseModel):
         default=False,
         description="If true, refresh this mental model after observations consolidation (real-time mode)",
     )
+    refresh_cron: str | None = Field(
+        default=None,
+        description=(
+            "Cron expression (UTC, standard 5-field syntax, e.g. '0 3 * * *' for daily at 03:00 UTC) "
+            "for refreshing this mental model on a fixed schedule. Mutually exclusive with "
+            "refresh_after_consolidation — a model refreshes either after consolidation or on a cron "
+            "schedule, not both. A scheduled refresh only runs when the model is stale (new memories in "
+            "its scope since the last refresh); if nothing changed, the tick is skipped to avoid a "
+            "wasted LLM call. null = no schedule."
+        ),
+    )
     fact_types: list[Literal["world", "experience", "observation"]] | None = Field(
         default=None,
         description="Filter which fact types are retrieved during reflect. None means all types (world, experience, observation).",
@@ -2010,6 +2051,31 @@ class MentalModelTrigger(BaseModel):
         if v is not None and len(v) == 0:
             raise ValueError("fact_types must not be empty. Use null to include all fact types.")
         return v
+
+    @field_validator("refresh_cron")
+    @classmethod
+    def validate_refresh_cron(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        from croniter import croniter
+
+        if not croniter.is_valid(v):
+            raise ValueError(f"refresh_cron is not a valid cron expression: {v!r}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_refresh_exclusivity(self) -> "MentalModelTrigger":
+        # A mental model refreshes either after consolidation (real-time) or on a
+        # cron schedule, never both — the two triggers would race and double-refresh.
+        if self.refresh_after_consolidation and self.refresh_cron:
+            raise ValueError(
+                "refresh_after_consolidation and refresh_cron are mutually exclusive: "
+                "a mental model refreshes either after consolidation or on a cron schedule, not both."
+            )
+        return self
 
 
 class MentalModelResponse(BaseModel):
@@ -2141,7 +2207,8 @@ class BankTemplateConfig(BaseModel):
     reflect_mission: str | None = Field(default=None, description="Mission/context for Reflect operations")
     retain_mission: str | None = Field(default=None, description="Steers what gets extracted during retain")
     retain_extraction_mode: str | None = Field(
-        default=None, description="Fact extraction mode: 'concise' (default), 'verbose', or 'custom'"
+        default=None,
+        description="Fact extraction mode: 'concise' (default), 'verbose', 'custom', 'verbatim', or 'chunks'",
     )
     retain_custom_instructions: str | None = Field(
         default=None, description="Custom extraction prompt (when mode='custom')"
@@ -2367,10 +2434,10 @@ def validate_bank_template(manifest: "BankTemplateManifest") -> list[str]:
     if manifest.bank:
         bank = manifest.bank
         if bank.retain_extraction_mode is not None:
-            valid_modes = ("concise", "verbose", "custom", "chunks")
-            if bank.retain_extraction_mode not in valid_modes:
+            if bank.retain_extraction_mode not in RETAIN_EXTRACTION_MODES:
                 errors.append(
-                    f"bank.retain_extraction_mode: must be one of {valid_modes}, got '{bank.retain_extraction_mode}'"
+                    "bank.retain_extraction_mode: "
+                    f"must be one of {RETAIN_EXTRACTION_MODES}, got '{bank.retain_extraction_mode}'"
                 )
         if bank.retain_custom_instructions and bank.retain_extraction_mode != "custom":
             errors.append("bank.retain_custom_instructions: requires retain_extraction_mode='custom'")
@@ -2546,6 +2613,10 @@ class OperationResponse(BaseModel):
     task_type: str
     items_count: int
     document_id: str | None = None
+    filename: str | None = Field(
+        default=None,
+        description="Original filename for file-conversion operations (file_convert_retain); null for other task types.",
+    )
     created_at: str
     updated_at: str | None = Field(
         default=None,
@@ -3055,8 +3126,12 @@ def create_app(
         # All current backends (PostgreSQL, Oracle) support async worker/poller.
         if config.worker_enabled and memory._backend.supports_worker_poller:
             from ..config import DEFAULT_DATABASE_SCHEMA
+            from ..utils import warn_if_container_default_worker_id
 
+            warn_if_container_default_worker_id(config.worker_id)
             worker_id = config.worker_id or socket.gethostname()
+            worker_id_source = "HINDSIGHT_API_WORKER_ID" if config.worker_id else "hostname (default)"
+            logging.info(f"Worker id: {worker_id} (source: {worker_id_source})")
             # Convert default schema to None for SQL compatibility (no schema prefix)
             schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
             poller = WorkerPoller(
@@ -3069,6 +3144,8 @@ def create_app(
                 max_slots=config.worker_max_slots,
                 slot_reservations=config.worker_slot_reservations,
                 consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
+                operation_retention_days=config.operation_retention_days,
+                operation_cleanup_batch_size=config.operation_cleanup_batch_size,
             )
             poller_task = asyncio.create_task(poller.run())
             logging.info(f"Worker poller started (worker_id={worker_id})")
@@ -3310,7 +3387,7 @@ def _register_routes(app: FastAPI):
                 api_key = authorization.strip()
         return RequestContext(api_key=api_key)
 
-    def precheck_for(operation: str):
+    def precheck_for(operation: PrecheckOperation):
         """
         Build a FastAPI dependency that runs ``OperationValidator.precheck``.
 
@@ -3465,7 +3542,7 @@ def _register_routes(app: FastAPI):
     async def api_graph(
         bank_id: str,
         type: str | None = None,
-        limit: int = 1000,
+        limit: int = Query(default=1000, ge=0),
         q: str | None = None,
         tags: list[str] | None = Query(None),
         tags_match: str = "all_strict",
@@ -3513,8 +3590,8 @@ def _register_routes(app: FastAPI):
         consolidation_state: str | None = None,
         state: str | None = None,
         document_id: str | None = None,
-        limit: int = 100,
-        offset: int = 0,
+        limit: int = Query(default=100, ge=0),
+        offset: int = Query(default=0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """
@@ -3561,7 +3638,7 @@ def _register_routes(app: FastAPI):
     async def _require_dry_run_enabled() -> None:
         """Feature-flag gate for dry-run extraction.
 
-        Declared as a dependency BEFORE ``precheck_for("dry_run_extract")`` so a
+        Declared as a dependency BEFORE ``precheck_for(PrecheckOperation.DRY_RUN_EXTRACT)`` so a
         disabled route returns 404 regardless of tenant/billing state — FastAPI
         resolves path-operation dependencies in signature order, so this runs
         first and preserves the original "disabled → 404" contract.
@@ -3591,7 +3668,7 @@ def _register_routes(app: FastAPI):
         body: DryRunExtractRequest,
         request_context: RequestContext = Depends(get_request_context),
         _enabled: None = Depends(_require_dry_run_enabled),
-        _precheck: None = Depends(precheck_for("dry_run_extract")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.DRY_RUN_EXTRACT)),
     ):
         try:
             override_fields = (
@@ -3680,13 +3757,23 @@ def _register_routes(app: FastAPI):
     ):
         """Curate a single memory unit (edit text / invalidate / revert)."""
         try:
+            occurred_start = (
+                ""
+                if "occurred_start" in request.model_fields_set and request.occurred_start is None
+                else request.occurred_start
+            )
+            occurred_end = (
+                ""
+                if "occurred_end" in request.model_fields_set and request.occurred_end is None
+                else request.occurred_end
+            )
             data = await app.state.memory.update_memory_unit(
                 bank_id=bank_id,
                 memory_id=memory_id,
                 text=request.text,
                 context=request.context,
-                occurred_start=request.occurred_start,
-                occurred_end=request.occurred_end,
+                occurred_start=occurred_start,
+                occurred_end=occurred_end,
                 new_fact_type=request.fact_type,
                 entities=request.entities,
                 state=request.state,
@@ -3759,7 +3846,7 @@ def _register_routes(app: FastAPI):
         request: RecallRequest,
         http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("recall")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RECALL)),
     ):
         """Run a recall and return results with trace."""
         import time
@@ -3826,6 +3913,7 @@ def _register_routes(app: FastAPI):
                         max_tokens=request.max_tokens,
                         enable_trace=request.trace,
                         fact_type=fact_types,
+                        prefer_observations=request.prefer_observations,
                         question_date=question_date,
                         include_entities=include_entities,
                         max_entity_tokens=max_entity_tokens,
@@ -3838,6 +3926,7 @@ def _register_routes(app: FastAPI):
                         tags=request.tags,
                         tags_match=request.tags_match,
                         tag_groups=request.tag_groups,
+                        min_scores=request.min_scores,
                     ),
                     operation="recall",
                     bank_id=bank_id,
@@ -3859,6 +3948,7 @@ def _register_routes(app: FastAPI):
                     chunk_id=fact.chunk_id,
                     tags=fact.tags,
                     source_fact_ids=fact.source_fact_ids,
+                    scores=fact.scores,
                 )
 
             recall_results = [_fact_to_result(fact) for fact in core_result.results]
@@ -3960,7 +4050,7 @@ def _register_routes(app: FastAPI):
         request: ReflectRequest,
         http_request: Request,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("reflect")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.REFLECT)),
     ):
         metrics = get_metrics_collector()
 
@@ -4118,11 +4208,17 @@ def _register_routes(app: FastAPI):
     )
     async def api_stats(
         bank_id: str,
+        refresh: bool = Query(
+            default=False,
+            description="Force a fresh recompute, bypassing the cached value (and refreshing the cache).",
+        ),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """Get statistics about memory nodes and links for a memory bank."""
         try:
-            stats = await app.state.memory.get_bank_stats(bank_id, request_context=request_context)
+            stats = await app.state.memory.get_bank_stats(
+                bank_id, request_context=request_context, force_refresh=refresh
+            )
             nodes_by_type = stats["node_counts"]
             links_by_type = stats["link_counts"]
             links_by_fact_type = stats["link_counts_by_fact_type"]
@@ -4248,8 +4344,8 @@ def _register_routes(app: FastAPI):
     )
     async def api_list_entities(
         bank_id: str,
-        limit: int = Query(default=100, description="Maximum number of entities to return"),
-        offset: int = Query(default=0, description="Offset for pagination"),
+        limit: int = Query(default=100, ge=0, description="Maximum number of entities to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """List entities for a memory bank with pagination."""
@@ -4284,7 +4380,7 @@ def _register_routes(app: FastAPI):
     )
     async def api_entity_graph(
         bank_id: str,
-        limit: int = Query(default=1000, description="Maximum number of co-occurrence edges to return"),
+        limit: int = Query(default=1000, ge=0, description="Maximum number of co-occurrence edges to return"),
         min_count: int = Query(default=1, description="Minimum cooccurrence_count to include an edge"),
         request_context: RequestContext = Depends(get_request_context),
     ):
@@ -4507,7 +4603,7 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         body: CreateMentalModelRequest,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("mental_model_create")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.MENTAL_MODEL_CREATE)),
     ):
         """Create a mental model (async - returns operation_id)."""
         try:
@@ -4556,7 +4652,7 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         mental_model_id: str,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("mental_model_refresh")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.MENTAL_MODEL_REFRESH)),
     ):
         """Refresh a mental model by re-running its source query (async)."""
         try:
@@ -4911,8 +5007,8 @@ def _register_routes(app: FastAPI):
         tags_match: str = Query(
             "any_strict", description="How to match tags: 'any', 'all', 'any_strict', 'all_strict'"
         ),
-        limit: int = 100,
-        offset: int = 0,
+        limit: int = Query(default=100, ge=0),
+        offset: int = Query(default=0, ge=0),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """
@@ -5096,8 +5192,8 @@ def _register_routes(app: FastAPI):
             default="memories",
             description="Where to read tags from: 'memories' (memory_units, default) or 'mental_models'.",
         ),
-        limit: int = Query(default=100, description="Maximum number of tags to return"),
-        offset: int = Query(default=0, description="Offset for pagination"),
+        limit: int = Query(default=100, ge=0, description="Maximum number of tags to return"),
+        offset: int = Query(default=0, ge=0, description="Offset for pagination"),
         request_context: RequestContext = Depends(get_request_context),
     ):
         """
@@ -5328,8 +5424,9 @@ def _register_routes(app: FastAPI):
         "/v1/default/banks/{bank_id}/operations/{operation_id}",
         response_model=OperationStatusResponse,
         summary="Get operation status",
-        description="Get the status of a specific async operation. Returns 'pending', 'completed', or 'failed'. "
-        "Completed operations are removed from storage, so 'completed' means the operation finished successfully.",
+        description="Get the status of a specific async operation. Returns 'pending', 'processing', 'completed', "
+        "'failed', or 'cancelled'. Completed operations remain queryable with their payload for the configured "
+        "retention window and are pruned afterward.",
         operation_id="get_operation_status",
         tags=["Operations"],
     )
@@ -5625,8 +5722,13 @@ def _register_routes(app: FastAPI):
     ):
         """Partially update an agent's profile (name, mission, disposition)."""
         try:
-            # Ensure bank exists
-            await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            # PATCH is update-only; missing banks must not be created as a
+            # side effect of reading the profile.
+            existing_profile = await app.state.memory.get_bank_profile(
+                bank_id, request_context=request_context, create_if_missing=False
+            )
+            if existing_profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
 
             # Update name if provided (stored in DB for display only, deprecated)
             if request.name is not None:
@@ -5642,7 +5744,11 @@ def _register_routes(app: FastAPI):
                 await app.state.memory._config_resolver.update_bank_config(bank_id, config_updates, request_context)
 
             # Get final profile
-            final_profile = await app.state.memory.get_bank_profile(bank_id, request_context=request_context)
+            final_profile = await app.state.memory.get_bank_profile(
+                bank_id, request_context=request_context, create_if_missing=False
+            )
+            if final_profile is None:
+                raise HTTPException(status_code=404, detail=f"Bank '{bank_id}' not found")
             disposition_dict = (
                 final_profile["disposition"].model_dump()
                 if hasattr(final_profile["disposition"], "model_dump")
@@ -6133,9 +6239,11 @@ def _register_routes(app: FastAPI):
             # Authenticate and set schema context for multi-tenant DB queries
             await app.state.memory._authenticate_tenant(request_context)
             if app.state.memory._operation_validator:
-                from hindsight_api.extensions import BankReadContext
+                from hindsight_api.extensions import BankReadContext, BankReadOperation
 
-                ctx = BankReadContext(bank_id=bank_id, operation="get_bank_config", request_context=request_context)
+                ctx = BankReadContext(
+                    bank_id=bank_id, operation=BankReadOperation.GET_BANK_CONFIG, request_context=request_context
+                )
                 await app.state.memory._validate_operation(
                     app.state.memory._operation_validator.validate_bank_read(ctx)
                 )
@@ -6181,9 +6289,11 @@ def _register_routes(app: FastAPI):
             # Authenticate and set schema context for multi-tenant DB queries
             await app.state.memory._authenticate_tenant(request_context)
             if app.state.memory._operation_validator:
-                from hindsight_api.extensions import BankWriteContext
+                from hindsight_api.extensions import BankWriteContext, BankWriteOperation
 
-                ctx = BankWriteContext(bank_id=bank_id, operation="update_bank_config", request_context=request_context)
+                ctx = BankWriteContext(
+                    bank_id=bank_id, operation=BankWriteOperation.UPDATE_BANK_CONFIG, request_context=request_context
+                )
                 await app.state.memory._validate_operation(
                     app.state.memory._operation_validator.validate_bank_write(ctx)
                 )
@@ -6240,9 +6350,11 @@ def _register_routes(app: FastAPI):
             # Authenticate and set schema context for multi-tenant DB queries
             await app.state.memory._authenticate_tenant(request_context)
             if app.state.memory._operation_validator:
-                from hindsight_api.extensions import BankWriteContext
+                from hindsight_api.extensions import BankWriteContext, BankWriteOperation
 
-                ctx = BankWriteContext(bank_id=bank_id, operation="reset_bank_config", request_context=request_context)
+                ctx = BankWriteContext(
+                    bank_id=bank_id, operation=BankWriteOperation.RESET_BANK_CONFIG, request_context=request_context
+                )
                 await app.state.memory._validate_operation(
                     app.state.memory._operation_validator.validate_bank_write(ctx)
                 )
@@ -6613,7 +6725,7 @@ def _register_routes(app: FastAPI):
         bank_id: str,
         request: RetainRequest,
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("retain")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.RETAIN)),
     ):
         """Retain memories with optional async processing."""
         metrics = get_metrics_collector()
@@ -6796,7 +6908,7 @@ def _register_routes(app: FastAPI):
         files: list[UploadFile] = File(..., description="Files to upload and convert"),
         request: str = Form(..., description="JSON string with FileRetainRequest model"),
         request_context: RequestContext = Depends(get_request_context),
-        _precheck: None = Depends(precheck_for("files_retain")),
+        _precheck: None = Depends(precheck_for(PrecheckOperation.FILES_RETAIN)),
     ):
         """Upload and convert files to memories."""
         from hindsight_api.config import get_config

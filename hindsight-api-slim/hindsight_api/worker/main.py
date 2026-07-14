@@ -136,7 +136,7 @@ def main():
     # Worker options
     parser.add_argument(
         "--worker-id",
-        default=config.worker_id or socket.gethostname(),
+        default=config.worker_id,
         help="Worker identifier (default: hostname, env: HINDSIGHT_API_WORKER_ID)",
     )
     parser.add_argument(
@@ -178,10 +178,17 @@ def main():
     # Configure logging
     config.configure_logging()
 
+    from ..utils import warn_if_container_default_worker_id
+
+    warn_if_container_default_worker_id(args.worker_id)
+    worker_id = args.worker_id or socket.gethostname()
+    worker_id_source = "HINDSIGHT_API_WORKER_ID/--worker-id" if args.worker_id else "hostname (default)"
+    logger.info(f"Worker id: {worker_id} (source: {worker_id_source})")
+
     # Import MemoryEngine here to avoid circular imports
     from .. import MemoryEngine
 
-    print(f"Starting Hindsight Worker: {args.worker_id}")
+    print(f"Starting Hindsight Worker: {worker_id}")
     print(f"  Poll interval: {args.poll_interval}ms")
     print(f"  Max retries: {args.max_retries}")
     print(f"  Max slots: {config.worker_max_slots}")
@@ -190,6 +197,11 @@ def main():
     shared_pool = max(0, config.worker_max_slots - sum(reservations.values()))
     print(f"  Slot reservations: {reservations_str}")
     print(f"  Shared pool: {shared_pool}")
+    if config.operation_retention_days == 0:
+        print("  Operation retention: disabled (terminal rows and payloads are kept)")
+    else:
+        print(f"  Operation retention: {config.operation_retention_days} days (terminal rows, payloads, and metadata)")
+        print(f"  Operation cleanup batch: {config.operation_cleanup_batch_size} rows/schema/cycle")
     print(f"  HTTP server: {args.http_host}:{args.http_port}")
     print()
 
@@ -249,7 +261,7 @@ def main():
         schema = None if config.database_schema == DEFAULT_DATABASE_SCHEMA else config.database_schema
         poller = WorkerPoller(
             backend=memory._backend,
-            worker_id=args.worker_id,
+            worker_id=worker_id,
             executor=memory.execute_task,
             poll_interval_ms=args.poll_interval,
             schema=schema,
@@ -257,6 +269,8 @@ def main():
             max_slots=config.worker_max_slots,
             slot_reservations=config.worker_slot_reservations,
             consolidation_bank_priority=config.worker_consolidation_bank_priority or None,
+            operation_retention_days=config.operation_retention_days,
+            operation_cleanup_batch_size=config.operation_cleanup_batch_size,
         )
 
         # Create the HTTP app for metrics/health

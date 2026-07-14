@@ -11,6 +11,22 @@ import pytest
 import pytest_asyncio
 from dotenv import load_dotenv
 
+# Force torch to initialize exactly once, in the main thread, at conftest import
+# time — before any fixture spins up an event loop or sentence-transformers'
+# thread pools. torch's C-level `_add_docstr(_has_torch_function, ...)` in
+# torch/overrides.py is not re-entrancy-safe: when the first `import torch`
+# happens lazily from inside concurrent/async code (e.g.
+# embeddings.initialize() -> sentence_transformers -> transformers -> torch, or
+# cross_encoder's ThreadPoolExecutor), torch/overrides.py can execute twice and
+# raise "RuntimeError: function '_has_torch_function' already has a docstring",
+# failing collection of every test on the pytest-xdist shard. Importing it here
+# (single-threaded, before any concurrency) makes that registration happen once
+# per worker process. Guarded so slim/no-torch environments still collect.
+try:
+    import torch  # noqa: F401  # eager one-time init; see comment above
+except ImportError:
+    pass
+
 from hindsight_api import LLMConfig, LocalSTEmbeddings, MemoryEngine, RequestContext
 from hindsight_api.engine.cross_encoder import LocalSTCrossEncoder
 from hindsight_api.engine.query_analyzer import DateparserQueryAnalyzer
@@ -38,6 +54,29 @@ async def _teardown_memory_engine(mem: MemoryEngine) -> None:
         unregister_span_recorder(mem._llm_recorder)
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_leaked_span_recorders():
+    """Fail-safe for the process-global LLM-trace recorder registry (#2229).
+
+    ``MemoryEngine.__init__`` registers its recorder in the shared registry, and
+    only ``close()`` removes it. Tests that construct an engine directly (without
+    ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder; a later
+    test's LLM calls then get recorded into the shared DB, flaking
+    ``test_llm_trace::test_disabled_writes_no_rows`` (it observes rows for its
+    bank even though its own recorder is disabled). ``_teardown_memory_engine``
+    guards the fixtures; this guards everything else by dropping any recorder a
+    test added to the registry.
+    """
+    from hindsight_api.tracing import get_span_recorder
+
+    recorders = get_span_recorder()._recorders
+    before = {id(r) for r in recorders}
+    yield
+    for recorder in list(recorders):
+        if id(recorder) not in before:
+            recorders.remove(recorder)
+
+
 # Default pg0 instance configuration for tests
 DEFAULT_PG0_INSTANCE_NAME = "hindsight-test"
 DEFAULT_PG0_PORT = int(os.environ.get("HINDSIGHT_TEST_PG_PORT", "5556"))
@@ -45,11 +84,13 @@ DEFAULT_PG0_PORT = int(os.environ.get("HINDSIGHT_TEST_PG_PORT", "5556"))
 # Keep the background MaintenanceLoop from auto-starting during tests. In
 # production it sweeps retention and re-schedules consolidation, but its timers
 # would race shared-pg0 test data (e.g. delete llm_requests/audit_log rows a test
-# just inserted). Disabling the reconcile interval and llm-trace retention — with
-# audit retention already off by default — leaves no job enabled, so the loop
-# never starts. Tests that exercise it call MaintenanceLoop methods
-# (_run_reconcile / _purge_expired) directly.
+# just inserted). Disabling the reconcile interval, the mental-model refresh tick
+# and llm-trace retention — with audit retention already off by default — leaves
+# no job enabled, so the loop never starts. Tests that exercise it call
+# MaintenanceLoop methods (_run_reconcile / _run_scheduled_mm_refresh /
+# _purge_expired) directly.
 os.environ.setdefault("HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS", "0")
+os.environ.setdefault("HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS", "0")
 os.environ.setdefault("HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS", "-1")
 
 

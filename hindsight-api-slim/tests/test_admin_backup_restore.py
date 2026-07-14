@@ -88,7 +88,10 @@ async def test_backup_tables_covers_entire_schema(backup_test_schema):
         await conn.close()
 
     # alembic_version is migration bookkeeping, not data — never backed up.
-    schema_tables = {r["table_name"] for r in rows} - {"alembic_version"}
+    # bank_stats_cache is a derived TTL cache of get_bank_stats results: it has no
+    # FK to banks (so the restore cascade never touches it) and repopulates itself
+    # on demand, so it is deliberately not backed up — a restore starts it cold.
+    schema_tables = {r["table_name"] for r in rows} - {"alembic_version", "bank_stats_cache"}
     backup_tables = set(BACKUP_TABLES)
 
     missing = schema_tables - backup_tables
@@ -547,3 +550,36 @@ async def test_run_migration_with_schema_only_runs_requested_schema(monkeypatch)
     assert calls["run_migrations"] == [("resolved::postgresql://test", "tenant_demo")]
     assert calls["ensure_vector_extension"] == [("resolved::postgresql://test", "pgvector", "tenant_demo")]
     assert calls["ensure_text_search_extension"] == [("resolved::postgresql://test", "native", "", "tenant_demo")]
+
+
+@pytest.mark.parametrize(
+    ("ensure_extensions", "expected"),
+    [(True, True), (False, False)],
+)
+@pytest.mark.asyncio
+async def test_run_migration_threads_ensure_extensions_flag(monkeypatch, ensure_extensions, expected):
+    """The --skip-extension-reconcile flag (ensure_extensions=False) must reach run_migrations_for_schemas.
+
+    The post-migration vector/text-search reconcile only does work on a backend change, so operators
+    can skip it on a no-change re-migration over many tenant schemas. Verify the flag is threaded through
+    rather than silently dropped.
+    """
+    monkeypatch.setenv("HINDSIGHT_API_DATABASE_URL", "postgresql://test")
+    captured: dict = {}
+
+    async def fake_resolve_database_url(db_url: str) -> str:
+        return f"resolved::{db_url}"
+
+    def fake_run_migrations_for_schemas(database_url, schemas, **kwargs):
+        captured["ensure_extensions"] = kwargs.get("ensure_extensions")
+
+    monkeypatch.setattr(admin_cli, "load_extension", lambda *args, **kwargs: None)
+    monkeypatch.setattr(admin_cli, "resolve_database_url", fake_resolve_database_url)
+
+    from hindsight_api import migrations as migrations_module
+
+    monkeypatch.setattr(migrations_module, "run_migrations_for_schemas", fake_run_migrations_for_schemas)
+
+    await admin_cli._run_migration("postgresql://test", schema="tenant_demo", ensure_extensions=ensure_extensions)
+
+    assert captured["ensure_extensions"] is expected

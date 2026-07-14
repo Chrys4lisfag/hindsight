@@ -243,16 +243,22 @@ class LinkExpansionRetriever(GraphRetriever):
         }
 
         sorted_ids = sorted(score_map.keys(), key=lambda x: score_map[x], reverse=True)[:budget]
-        rows = [row_map[fact_id] for fact_id in sorted_ids]
 
         results = []
-        for row in rows:
+        for fact_id in sorted_ids:
+            row = row_map[fact_id]
             result = RetrievalResult.from_db_row(dict(row))
-            result.activation = row["score"]
+            # ``activation`` is used to re-sort graph results after fact types are
+            # combined. It must retain the final additive score rather than the
+            # raw score from one signal, which would otherwise discard the other
+            # signals and make the cross-fact-type order disagree with this order.
+            result.activation = score_map[fact_id]
             results.append(result)
 
-        if tags:
-            results = filter_results_by_tags(results, tags, match=tags_match)
+        # filter_results_by_tags is a no-op when no filter applies (tags falsy and not
+        # the exact-empty/global scope), so call it unconditionally — gating on `if tags:`
+        # would skip the untagged-only filter for tags=[] + tags_match="exact".
+        results = filter_results_by_tags(results, tags, match=tags_match)
 
         if tag_groups:
             results = filter_results_by_tag_groups(results, tag_groups)

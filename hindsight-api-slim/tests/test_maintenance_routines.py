@@ -135,6 +135,33 @@ async def test_banks_needing_consolidation_includes_in_flight_after_completion(m
 
 
 @pytest.mark.asyncio
+async def test_banks_needing_consolidation_skips_schema_with_vanished_table(memory: MemoryEngine):
+    """A schema discovered via its ``memory_units`` table but missing the
+    ``banks`` table the routine joins must be skipped, not abort the scan.
+
+    This reproduces the time-of-check/time-of-use race deterministically: the
+    routine snapshots schemas owning ``memory_units`` from ``pg_class`` and then
+    joins each schema's ``banks`` table. A tenant being dropped or migrated (and,
+    in the test suite, the concurrent multi-tenant maintenance test) can leave a
+    schema whose ``banks`` table is gone. Before the fix the dynamic query raised
+    ``undefined_table`` and aborted the whole routine (migration c7e9f1a3b5d2)."""
+    schema = f"mtvanish{uuid.uuid4().hex[:8]}"
+    try:
+        async with memory._pool.acquire() as conn:
+            await conn.execute(f'CREATE SCHEMA "{schema}"')
+            # Discovered by the FOR loop (has memory_units) but the JOIN target
+            # `banks` is absent — exactly a half-built / vanishing schema.
+            await conn.execute(f'CREATE TABLE "{schema}".memory_units (LIKE public.memory_units INCLUDING DEFAULTS)')
+
+            # Must not raise; the bad schema is simply skipped.
+            rows = await conn.fetch("SELECT schema_name, bank_id FROM public.banks_needing_consolidation()")
+            assert schema not in {r["schema_name"] for r in rows}
+    finally:
+        async with memory._pool.acquire() as conn:
+            await conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@pytest.mark.asyncio
 async def test_schemas_with_expired_rows(memory: MemoryEngine):
     """Returns schemas holding a row older than p_days; respects the p_days<=0 guard."""
     async with memory._pool.acquire() as conn:
@@ -155,3 +182,45 @@ async def test_schemas_with_expired_rows(memory: MemoryEngine):
         # Disabled retention (days <= 0): always empty.
         disabled = await conn.fetch("SELECT * FROM public.schemas_with_expired_rows('audit_log', 'started_at', 0)")
         assert len(disabled) == 0
+
+
+def _load_all_schema_migration():
+    """Import the #2638 all-schema-run install migration by path."""
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "hindsight_api/alembic/versions/f2a4b6c8d0e2_maintenance_routines_all_schema_runs.py"
+    )
+    spec = importlib.util.spec_from_file_location("_maint_routines_all_schema", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_routines_install_on_non_public_schema_run(monkeypatch):
+    """Regression for #2638: a single-tenant deploy migrated into a non-``public``
+    schema must still create the shared ``public.*`` routines.
+
+    The runtime migrates only the configured schema, so ``target_schema`` is
+    never falsy/``public`` and the earlier public-only-gated migrations skipped
+    creation, leaving the maintenance loop logging ``function public.… does not
+    exist`` forever. ``f2a4b6c8d0e2`` installs unconditionally (guarded by a
+    transaction-scoped advisory lock), so ``_pg_upgrade`` issues the
+    ``CREATE OR REPLACE`` regardless of ``target_schema``.
+    """
+    migration = _load_all_schema_migration()
+
+    executed: list[str] = []
+    monkeypatch.setattr(migration.op, "execute", lambda sql: executed.append(str(sql)))
+
+    migration._pg_upgrade()
+
+    joined = "\n".join(executed)
+    # Serialized against concurrent per-schema migration processes.
+    assert "pg_advisory_xact_lock" in joined
+    # Both routines (re)created in public — this is what a non-public run failed to do.
+    assert "CREATE OR REPLACE FUNCTION public.banks_needing_consolidation" in joined
+    assert "CREATE OR REPLACE FUNCTION public.schemas_with_expired_rows" in joined
+    # And crucially: no target_schema gate — the module must not reintroduce the
+    # public-only guard (``_should_install_public_routines``) that caused #2638.
+    assert not hasattr(migration, "_should_install_public_routines")

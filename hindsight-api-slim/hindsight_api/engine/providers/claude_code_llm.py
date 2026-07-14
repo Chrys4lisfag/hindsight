@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from hindsight_api.engine.llm_interface import LLMInterface
+from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.metrics import get_metrics_collector
 
@@ -46,6 +47,20 @@ def _get_isolated_claude_env() -> dict[str, str]:
         }
         logger.debug(f"Claude Code: isolated CLAUDE_CONFIG_DIR={path}")
     return _isolated_claude_env
+
+
+def _result_error_detail(message: Any) -> str:
+    """Build an actionable error string from an ``is_error`` ResultMessage.
+
+    The CLI can report a failure with ``is_error=True`` while ``subtype``
+    still reads ``"success"``, putting the real detail in ``result`` (e.g.
+    quota exhaustion: ``You've hit your weekly limit · resets ...`` with
+    ``api_error_status: 429``). The SDK's own fallback exception surfaces
+    only the subtype, producing the misleading "Claude Code returned an
+    error result: success" (issue #2702) — so prefer ``result``.
+    """
+    detail = (message.result or "").strip() or message.subtype or "unknown error"
+    return f"Claude Code reported an error: {detail}"
 
 
 class ClaudeCodeLLM(LLMInterface):
@@ -118,12 +133,14 @@ class ClaudeCodeLLM(LLMInterface):
         Raises:
             RuntimeError: If the connection test fails.
         """
+        from ...config import get_config
+
         try:
             test_messages = [{"role": "user", "content": "test"}]
             await self.call(
                 messages=test_messages,
                 max_completion_tokens=10,
-                temperature=0.0,
+                temperature=get_config().llm_temperature_verification,
                 scope="verification",
                 max_retries=0,
             )
@@ -173,6 +190,7 @@ class ClaudeCodeLLM(LLMInterface):
         from claude_agent_sdk import (  # type: ignore[unresolved-import]
             AssistantMessage,
             ClaudeAgentOptions,
+            ResultMessage,
             TextBlock,
             query,
         )
@@ -225,6 +243,21 @@ class ClaudeCodeLLM(LLMInterface):
                         for block in message.content:
                             if isinstance(block, TextBlock):
                                 full_text += block.text
+                    elif isinstance(message, ResultMessage) and message.is_error:
+                        # Surface the CLI's actual error text (e.g. quota
+                        # exhaustion) instead of the SDK's subtype-based
+                        # fallback exception (issue #2702).
+                        raise RuntimeError(_result_error_detail(message))
+
+                # The Claude Agent SDK doesn't report exact counts; stash the same
+                # char/4 estimate the success path traces so a later parse/validate
+                # failure records consistent (estimated) tokens, not zero (#2387).
+                stash_response_usage(
+                    LLMResponseUsage(
+                        input_tokens=sum(len(m.get("content", "")) for m in messages) // 4,
+                        output_tokens=len(full_text) // 4,
+                    )
+                )
 
                 # Handle structured output
                 if response_format is not None:
@@ -380,6 +413,7 @@ class ClaudeCodeLLM(LLMInterface):
             AssistantMessage,
             ClaudeAgentOptions,
             ClaudeSDKClient,
+            ResultMessage,
             SdkMcpTool,
             TextBlock,
             ToolUseBlock,
@@ -519,6 +553,9 @@ class ClaudeCodeLLM(LLMInterface):
 
                     # Receive response
                     async for message in client.receive_response():
+                        if isinstance(message, ResultMessage) and message.is_error:
+                            # Surface the CLI's actual error text (issue #2702).
+                            raise RuntimeError(_result_error_detail(message))
                         if isinstance(message, AssistantMessage):
                             for block in message.content:
                                 if isinstance(block, TextBlock):

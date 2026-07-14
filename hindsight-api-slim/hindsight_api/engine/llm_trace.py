@@ -76,6 +76,51 @@ _request_ctx: ContextVar[dict[str, Any] | None] = ContextVar("hindsight_llm_requ
 _call_metadata_ctx: ContextVar[dict[str, Any] | None] = ContextVar("hindsight_llm_call_metadata_ctx", default=None)
 
 
+@dataclass
+class LLMResponseUsage:
+    """Provider-reported token usage for the in-flight LLM call.
+
+    Stashed by provider implementations as soon as a response is received —
+    *before* local JSON parsing / schema validation, which may still fail. The
+    wrapper reads it to attach real token counts to an error trace when the
+    provider call itself succeeded but the structured output couldn't be parsed
+    or validated (providers charge for those tokens regardless). See #2387.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+
+
+# Per-call provider usage, set by providers right after a response is received.
+_response_usage_ctx: ContextVar[LLMResponseUsage | None] = ContextVar("hindsight_llm_response_usage_ctx", default=None)
+
+
+def set_response_usage(usage: LLMResponseUsage | None) -> Token:
+    """Bind provider-reported usage for the current call. Returns a reset token."""
+    return _response_usage_ctx.set(usage)
+
+
+def stash_response_usage(usage: LLMResponseUsage | None) -> None:
+    """Record provider-reported usage so an error trace can attach it later.
+
+    Called by provider implementations once a response (with usage) is in hand,
+    before parsing/validation that may raise. Overwrites any prior value from an
+    earlier retry attempt so the last attempt's usage wins.
+    """
+    _response_usage_ctx.set(usage)
+
+
+def reset_response_usage(token: Token) -> None:
+    """Unwind a binding made by :func:`set_response_usage`."""
+    _response_usage_ctx.reset(token)
+
+
+def current_response_usage() -> LLMResponseUsage | None:
+    """Return the active call's provider-reported usage, or None."""
+    return _response_usage_ctx.get()
+
+
 def set_trace_context(ctx: LLMTraceContext | None) -> Token:
     """Bind trace attribution to the current context. Returns a reset token."""
     return _trace_ctx.set(ctx)
@@ -432,6 +477,12 @@ class LLMTraceRecorder:
         if pool is None:
             logger.debug("LLM trace skipped: pool not available")
             return
+        # Guard against the backend existing but its internal asyncpg pool being
+        # None (during/after shutdown — close() calls backend.shutdown() which
+        # sets _pool=None before the backend object itself is dereferenced).
+        if getattr(pool, "_pool", "missing") is None:
+            logger.debug("LLM trace skipped: backend pool not initialized (shutdown in progress?)")
+            return
         try:
             schema = self._schema_getter()
             table = f"{schema}.llm_requests"
@@ -473,7 +524,13 @@ class LLMTraceRecorder:
                     _safe_json(record.metadata, self._max_chars) or "{}",
                 )
         except Exception as e:
-            logger.warning(f"LLM trace write failed for scope={record.scope}: {e}")
+            err_str = str(e)
+            # Downgrade known shutdown-related errors to DEBUG — these are
+            # expected races during daemon close()/restart and are not actionable.
+            if "pool is closing" in err_str or "not initialized" in err_str:
+                logger.debug("LLM trace write skipped (shutdown race) for scope=%s: %s", record.scope, e)
+            else:
+                logger.warning(f"LLM trace write failed for scope={record.scope}: {e}")
 
     async def _flush_pending(self, trace_id: str) -> None:
         """Await this trace's in-flight writes so its rows exist before an UPDATE."""
@@ -537,4 +594,8 @@ class LLMTraceRecorder:
                     json.dumps(patch),
                 )
         except Exception as e:
-            logger.warning(f"LLM trace memory_id attach failed for trace={trace_id}: {e}")
+            err_str = str(e)
+            if "pool is closing" in err_str or "not initialized" in err_str:
+                logger.debug("LLM trace memory_id attach skipped (shutdown race) for trace=%s: %s", trace_id, e)
+            else:
+                logger.warning(f"LLM trace memory_id attach failed for trace={trace_id}: {e}")

@@ -9,12 +9,15 @@ success/error paths, and the HTTP read API (list / stats / tokens).
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import pytest_asyncio
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from hindsight_api import tracing
 from hindsight_api.api import create_app
@@ -206,6 +209,234 @@ async def test_wrapper_error_forwarded_and_reraised(registered_recorder):
     assert "kaboom" in r.error
 
 
+class _StashThenRaiseProvider:
+    """Provider impl that mimics a successful call whose response carries usage,
+    then fails locally during parsing/validation (#2387)."""
+
+    def __init__(self, usage: llm_trace.LLMResponseUsage | None, exc: Exception):
+        self._usage = usage
+        self._exc = exc
+
+    async def call(self, **_kwargs):
+        if self._usage is not None:
+            llm_trace.stash_response_usage(self._usage)
+        raise self._exc
+
+    async def call_with_tools(self, **_kwargs):
+        if self._usage is not None:
+            llm_trace.stash_response_usage(self._usage)
+        raise self._exc
+
+
+@pytest.mark.asyncio
+async def test_wrapper_error_attaches_provider_usage_on_parse_failure(registered_recorder):
+    """When the provider call succeeds (and reports usage) but local parsing/
+    validation raises, the error trace keeps the provider-reported tokens."""
+    llm = LLMProvider(provider="mock", api_key="", base_url="", model="mock")
+    llm._provider_impl = _StashThenRaiseProvider(
+        usage=llm_trace.LLMResponseUsage(input_tokens=321, output_tokens=12, cached_tokens=64),
+        exc=ValueError("invalid structured output"),
+    )
+
+    with pytest.raises(ValueError, match="invalid structured output"):
+        await llm.call(messages=[{"role": "user", "content": "x"}], scope="memory")
+
+    assert len(registered_recorder.records) == 1
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.input_tokens == 321
+    assert r.output_tokens == 12
+    assert r.cached_tokens == 64
+    assert r.total_tokens == 333
+    # contextvar is unwound after the call so the next call starts clean
+    assert llm_trace.current_response_usage() is None
+
+
+@pytest.mark.asyncio
+async def test_wrapper_error_without_provider_usage_records_zero(registered_recorder):
+    """A failure before any response (no usage stashed) still records 0 tokens."""
+    llm = LLMProvider(provider="mock", api_key="", base_url="", model="mock")
+    llm._provider_impl = _StashThenRaiseProvider(usage=None, exc=RuntimeError("connection reset"))
+
+    with pytest.raises(RuntimeError, match="connection reset"):
+        await llm.call(messages=[{"role": "user", "content": "x"}], scope="memory")
+
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.input_tokens is None
+    assert r.output_tokens is None
+    assert r.cached_tokens is None
+
+
+@pytest.mark.asyncio
+async def test_wrapper_tools_error_attaches_provider_usage(registered_recorder):
+    """The tool-calling path forwards provider usage onto error traces too."""
+    llm = LLMProvider(provider="mock", api_key="", base_url="", model="mock")
+    llm._provider_impl = _StashThenRaiseProvider(
+        usage=llm_trace.LLMResponseUsage(input_tokens=50, output_tokens=5),
+        exc=ValueError("bad tool args"),
+    )
+
+    with pytest.raises(ValueError, match="bad tool args"):
+        await llm.call_with_tools(
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            scope="tools",
+        )
+
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.input_tokens == 50
+    assert r.output_tokens == 5
+
+
+# ── real provider: structured-output failure keeps provider usage (#2387) ─────
+
+
+class _Extracted(BaseModel):
+    """Stand-in for a retain fact-extraction schema."""
+
+    fact: str
+
+
+def _openai_response_with_usage(content: str):
+    """A successful OpenAI-shaped response carrying usage, like the provider sees
+    right before it parses/validates ``content``."""
+    message = SimpleNamespace(content=content, tool_calls=None, refusal=None)
+    choice = SimpleNamespace(finish_reason="stop", message=message)
+    usage = SimpleNamespace(
+        prompt_tokens=140,
+        completion_tokens=18,
+        total_tokens=158,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=20),
+    )
+    return SimpleNamespace(error=None, usage=usage, choices=[choice])
+
+
+@pytest.mark.asyncio
+async def test_retain_extract_json_parse_failure_keeps_usage(registered_recorder):
+    """The provider call succeeds (and reports usage) but returns non-JSON for a
+    structured request; the retain-extraction error trace keeps the tokens."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="gpt-4o-mini")
+    llm._provider_impl._client.chat.completions.create = AsyncMock(
+        return_value=_openai_response_with_usage("not valid json at all")
+    )
+
+    with pytest.raises(json.JSONDecodeError):
+        await llm.call(
+            messages=[{"role": "user", "content": "extract facts"}],
+            response_format=_Extracted,
+            scope="retain_extract_facts",
+            max_retries=0,
+        )
+
+    assert len(registered_recorder.records) == 1
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.scope == "retain_extract_facts"
+    assert r.input_tokens == 140
+    assert r.output_tokens == 18
+    assert r.cached_tokens == 20
+    assert r.total_tokens == 158
+
+
+@pytest.mark.asyncio
+async def test_retain_extract_validation_failure_keeps_usage(registered_recorder):
+    """Valid JSON that doesn't match the schema fails ``model_validate`` locally
+    after a successful (billed) provider call; usage must survive."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="gpt-4o-mini")
+    # Parses fine, but ``fact`` is missing → pydantic ValidationError.
+    llm._provider_impl._client.chat.completions.create = AsyncMock(
+        return_value=_openai_response_with_usage('{"wrong_field": 1}')
+    )
+
+    with pytest.raises(ValidationError):
+        await llm.call(
+            messages=[{"role": "user", "content": "extract facts"}],
+            response_format=_Extracted,
+            scope="retain_extract_facts",
+            max_retries=0,
+        )
+
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.input_tokens == 140
+    assert r.output_tokens == 18
+    assert r.cached_tokens == 20
+
+
+@pytest.mark.asyncio
+async def test_retain_extract_success_records_usage_once(registered_recorder):
+    """Sanity check the happy path the failure tests are contrasted against:
+    valid structured output records a single success trace with the same usage."""
+    llm = LLMProvider(provider="openai", api_key="test-key", base_url="https://example.test/v1", model="gpt-4o-mini")
+    llm._provider_impl._client.chat.completions.create = AsyncMock(
+        return_value=_openai_response_with_usage('{"fact": "the sky is blue"}')
+    )
+
+    result = await llm.call(
+        messages=[{"role": "user", "content": "extract facts"}],
+        response_format=_Extracted,
+        scope="retain_extract_facts",
+        max_retries=0,
+    )
+
+    assert isinstance(result, _Extracted)
+    assert len(registered_recorder.records) == 1
+    r = registered_recorder.records[0]
+    assert r.status == "success"
+    assert r.input_tokens == 140
+    assert r.output_tokens == 18
+    assert r.cached_tokens == 20
+
+
+# ── real provider: litellm tool-call arg-parse failure keeps usage (#2387) ────
+
+
+def _litellm_tool_response_with_usage(arguments: str):
+    """A successful LiteLLM (OpenAI-shaped) tool-call response carrying usage,
+    like ``call_with_tools`` sees right before it ``json.loads`` the tool
+    arguments."""
+    function = SimpleNamespace(name="extract", arguments=arguments)
+    tool_call = SimpleNamespace(id="call_1", function=function)
+    message = SimpleNamespace(content=None, tool_calls=[tool_call])
+    choice = SimpleNamespace(finish_reason="tool_calls", message=message)
+    usage = SimpleNamespace(
+        prompt_tokens=140,
+        completion_tokens=18,
+        total_tokens=158,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=20),
+    )
+    return SimpleNamespace(error=None, usage=usage, choices=[choice])
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_call_arg_parse_failure_keeps_usage(registered_recorder):
+    """The litellm tool path bills the provider response, then ``json.loads`` the
+    tool-call arguments locally; malformed args raise after billing, so the error
+    trace must keep the provider-reported tokens. Exercises the real
+    ``LiteLLMLLM.call_with_tools`` stash that ``LiteLLMRouterLLM`` also inherits
+    (the wrapper-level tools test uses a provider that already stashes)."""
+    llm = LLMProvider(provider="litellm", api_key="test-key", base_url="https://example.test/v1", model="gpt-4o-mini")
+    # Valid response + usage, but the tool arguments are not valid JSON.
+    llm._provider_impl._acompletion = AsyncMock(return_value=_litellm_tool_response_with_usage("{not valid json"))
+
+    with pytest.raises(json.JSONDecodeError):
+        await llm.call_with_tools(
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            scope="tools",
+            max_retries=0,
+        )
+
+    assert len(registered_recorder.records) == 1
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.input_tokens == 140
+    assert r.output_tokens == 18
+    assert r.cached_tokens == 20
+
+
 @pytest.mark.asyncio
 async def test_configured_provider_binds_bank_context(registered_recorder):
     llm = LLMProvider(provider="mock", api_key="", base_url="", model="mock")
@@ -235,7 +466,6 @@ async def test_engine_teardown_unregisters_recorder_even_when_close_skipped():
     leave the registry exactly as it found it.
     """
     from hindsight_api import tracing
-
     from tests.conftest import _teardown_memory_engine
 
     sentinel = object()
@@ -570,3 +800,129 @@ async def test_real_llm_retain_and_consolidation_traced(memory_real_llm):
         assert by_op["consolidation"][0]["metadata"].get("source_memory_ids"), (
             "consolidation trace missing source_memory_ids"
         )
+
+
+# ── recorder: shutdown / pre-init race conditions ─────────────────────────────
+
+
+class _UninitializedBackend:
+    """Mimics a DB backend before initialize() or after shutdown(): the object
+    exists but the internal asyncpg pool is None, so acquiring raises."""
+
+    _pool: object | None = None
+
+    async def acquire(self):
+        raise RuntimeError("PostgreSQLBackend is not initialized. Call initialize() first.")
+
+
+class _ClosingBackend:
+    """Mimics a backend whose pool is mid-shutdown: the pool object exists but
+    asyncpg raises InterfaceError('pool is closing') on acquire."""
+
+    _pool = object()  # not None, passes the getattr guard
+
+    async def acquire(self):
+        raise Exception("pool is closing")
+
+
+class _UnexpectedErrorBackend:
+    """Mimics a backend with an unexpected (non-shutdown) error."""
+
+    _pool = object()
+
+    async def acquire(self):
+        raise RuntimeError("connection refused: some other error")
+
+
+def _make_record(scope: str = "verification") -> LLMRequestRecord:
+    return LLMRequestRecord(
+        provider="test",
+        model="test-model",
+        scope=scope,
+        status="success",
+        started_at=datetime.now(timezone.utc),
+        ended_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_safe_write_pool_none_skips_quietly(caplog):
+    """pool_getter returning None should skip at debug, never warn."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: None,
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for pool=None, got: {[r.message for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_safe_write_backend_pool_none_skips_quietly(caplog):
+    """Backend exists but its internal _pool is None (post-shutdown) — should
+    skip at debug via the getattr guard, never warn."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _UninitializedBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for backend._pool=None, got: {[r.message for r in warnings]}"
+    assert any("not initialized" in r.message or "pool not" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_safe_write_pool_closing_downgrades_to_debug(caplog):
+    """asyncpg InterfaceError('pool is closing') during acquire should be
+    downgraded to debug, not warned."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _ClosingBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for pool-is-closing, got: {[r.message for r in warnings]}"
+    assert any("shutdown race" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_safe_write_unexpected_error_still_warns(caplog):
+    """Non-shutdown errors should still produce a WARNING."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _UnexpectedErrorBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly 1 warning for unexpected error, got: {[r.message for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_attach_memory_ids_pool_none_skips_quietly(caplog):
+    """_attach_memory_ids with _pool=None should skip at debug, never warn."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _UninitializedBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._attach_memory_ids(
+            bank_id="test-bank",
+            trace_id="test-trace",
+            patch={"memory_ids": ["m1"]},
+        )
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for attach with _pool=None, got: {[r.message for r in warnings]}"

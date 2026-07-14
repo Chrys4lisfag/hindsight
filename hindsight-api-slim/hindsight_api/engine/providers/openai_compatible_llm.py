@@ -37,6 +37,7 @@ from openai import APIConnectionError, APIStatusError, AsyncOpenAI, LengthFinish
 from hindsight_api.config import DEFAULT_LLM_TIMEOUT, ENV_LLM_TIMEOUT
 from hindsight_api.engine.bank_attribution import apply_bank_attribution
 from hindsight_api.engine.llm_interface import LLMInterface, OutputTooLongError, ProviderRateLimitResetError
+from hindsight_api.engine.llm_trace import LLMResponseUsage, stash_response_usage
 from hindsight_api.engine.response_models import LLMToolCall, LLMToolCallResult, TokenUsage
 from hindsight_api.metrics import get_metrics_collector
 from hindsight_api.worker.stage import set_stage
@@ -46,6 +47,19 @@ logger = logging.getLogger(__name__)
 # Seed applied to every Groq request for deterministic behavior
 DEFAULT_LLM_SEED = 4242
 JSON_MODE_USER_HINT = "Return valid json only."
+DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS = 512
+
+
+def _validate_ollama_num_ctx(value: Any) -> int | None:
+    """Validate a native Ollama context-window override."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"ollama_num_ctx must be a positive integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"ollama_num_ctx must be >= 1, got {value}")
+    return value
+
 
 # Self-hosted OpenAI-compatible servers that advertise tool_choice="required"
 # but silently ignore it: instead of forcing a tool call they return
@@ -66,23 +80,68 @@ class ProviderResponseError(RuntimeError):
         self.retryable = retryable
 
 
+def _is_json(text: str) -> bool:
+    """True if ``text`` parses as a JSON value."""
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return True
+
+
+def _outer_json_span(content: str) -> str | None:
+    """Return the outermost ``{...}`` / ``[...]`` span if it parses as JSON, else None.
+
+    Fallback for responses where fences are partial/absent or the model wrapped
+    the JSON in surrounding prose. Only returned when it is valid JSON so callers
+    never receive a worse candidate than the raw content.
+    """
+    starts = [i for i in (content.find("{"), content.find("[")) if i >= 0]
+    ends = [i for i in (content.rfind("}"), content.rfind("]")) if i >= 0]
+    if not starts or not ends:
+        return None
+    start, end = min(starts), max(ends)
+    if end <= start:
+        return None
+    candidate = content[start : end + 1].strip()
+    return candidate if _is_json(candidate) else None
+
+
 def _strip_code_fences(content: str) -> str:
     """Strip markdown code fences from LLM response if present.
 
     Many LLM providers (MiniMax, some Ollama models, Claude via proxies)
     wrap JSON responses in ```json ... ``` fences even when json_object
-    response format is requested. This strips the fences while preserving
-    the JSON content inside. Returns the original content unchanged if
-    no fences are detected.
+    response format is requested. Fences are detected by line (a closing
+    ``` must sit alone on its line) so triple-backticks *inside* JSON string
+    values do not truncate the payload. When the stripped candidate is not
+    valid JSON (partial fence, prose-wrapped output, truncated response), fall
+    back to the outermost parseable JSON span. Returns the original content
+    unchanged if no better candidate is found.
     """
-    if "```" not in content:
-        return content
-    try:
-        if "```json" in content:
-            return content.split("```json")[1].split("```")[0].strip()
-        return content.split("```")[1].split("```")[0].strip()
-    except (IndexError, ValueError):
-        return content
+    candidate = content
+    if "```" in content:
+        lines = content.split("\n")
+        # Find first line that starts a code fence (``` optionally followed by language)
+        fence_start = next((i for i, line in enumerate(lines) if line.startswith("```")), None)
+        if fence_start is not None:
+            # Find matching closing fence (``` alone or with trailing whitespace)
+            fence_end = next(
+                (j for j in range(fence_start + 1, len(lines)) if lines[j].strip() == "```"),
+                None,
+            )
+            if fence_end is not None:
+                candidate = "\n".join(lines[fence_start + 1 : fence_end]).strip()
+
+    if _is_json(candidate):
+        return candidate
+
+    # Fence stripping did not yield valid JSON — try to recover the outer JSON span.
+    span = _outer_json_span(content)
+    if span is not None:
+        return span
+
+    return candidate
 
 
 # Reasoning/thinking tags emitted by extended-thinking models. Some providers
@@ -230,6 +289,21 @@ def _content_or_error(response: Any, *, provider: str, model: str, scope: str) -
             retryable=retryable,
         )
     return content, choice
+
+
+def _usage_from_openai_response(response: Any) -> LLMResponseUsage:
+    """Extract prompt/completion/cached token counts from an OpenAI-shaped usage block."""
+    usage = getattr(response, "usage", None)
+    input_tokens = (usage.prompt_tokens or 0) if usage else 0
+    output_tokens = (usage.completion_tokens or 0) if usage else 0
+    cached_tokens = 0
+    if usage and getattr(usage, "prompt_tokens_details", None):
+        cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+    return LLMResponseUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
+    )
 
 
 def _ensure_json_word_in_user_message(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -419,6 +493,8 @@ class OpenAICompatibleLLM(LLMInterface):
         timeout: float | None = None,
         groq_service_tier: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        *,
+        ollama_num_ctx: int | None = None,
         **kwargs: Any,
     ):
         """
@@ -433,6 +509,8 @@ class OpenAICompatibleLLM(LLMInterface):
             timeout: Request timeout in seconds (uses env var or 120s default).
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto").
             extra_body: Extra body params merged into every API call.
+            ollama_num_ctx: Native Ollama context window override. None lets Ollama use
+                the model/server default.
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
@@ -449,8 +527,10 @@ class OpenAICompatibleLLM(LLMInterface):
             "deepseek",
             "volcano",
             "openrouter",
+            "requesty",
             "zai",
             "opencode-go",
+            "atlas",
             "fireworks",
         ]
         if self.provider not in valid_providers:
@@ -472,10 +552,14 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = "https://api.deepseek.com"
             elif self.provider == "openrouter":
                 self.base_url = "https://openrouter.ai/api/v1"
+            elif self.provider == "requesty":
+                self.base_url = "https://router.requesty.ai/v1"
             elif self.provider == "zai":
                 self.base_url = "https://api.z.ai/api/coding/paas/v4"
             elif self.provider == "opencode-go":
                 self.base_url = "https://opencode.ai/zen/go/v1"
+            elif self.provider == "atlas":
+                self.base_url = "https://api.atlascloud.ai/v1"
             elif self.provider == "fireworks":
                 # OpenAI-compatible inference host (online path). The batch API
                 # lives on a separate control-plane host — see FireworksLLM.
@@ -494,8 +578,10 @@ class OpenAICompatibleLLM(LLMInterface):
                 "minimax",
                 "deepseek",
                 "openrouter",
+                "requesty",
                 "zai",
                 "opencode-go",
+                "atlas",
                 "ollama-cloud",
             )
             and not self.api_key
@@ -505,6 +591,7 @@ class OpenAICompatibleLLM(LLMInterface):
         # Service tier configuration (from config, not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = kwargs.get("openai_service_tier")
+        self.ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
         # User-configured extra body params (merged into every API call)
         self._config_extra_body = extra_body or {}
 
@@ -547,6 +634,10 @@ class OpenAICompatibleLLM(LLMInterface):
             return True
         return self.provider == "openai" and bool(self.base_url)
 
+    def _verification_max_completion_tokens(self) -> int:
+        """Return the startup verification budget for OpenAI-compatible gateways."""
+        return DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS
+
     async def verify_connection(self) -> None:
         """
         Verify that the provider is configured correctly by making a simple test call.
@@ -558,7 +649,7 @@ class OpenAICompatibleLLM(LLMInterface):
             logger.info(f"Verifying connection: {self.provider}/{self.model}")
             await self.call(
                 messages=[{"role": "user", "content": "Say 'ok'"}],
-                max_completion_tokens=100,
+                max_completion_tokens=self._verification_max_completion_tokens(),
                 max_retries=2,
                 initial_backoff=0.5,
                 max_backoff=2.0,
@@ -619,6 +710,11 @@ class OpenAICompatibleLLM(LLMInterface):
         # openai with custom base_url, ollama, lmstudio, minimax, volcano —
         # use the widely-supported max_tokens
         return "max_tokens"
+
+    def _apply_provider_extra_body_defaults(self, extra_body: dict[str, Any]) -> None:
+        """Apply provider-specific extra_body defaults while preserving user overrides."""
+        if self.provider == "minimax":
+            extra_body.setdefault("thinking", {"type": "disabled"})
 
     async def call(
         self,
@@ -707,6 +803,7 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
+        self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
             # Add service_tier if configured
@@ -770,6 +867,9 @@ class OpenAICompatibleLLM(LLMInterface):
             try:
                 if response_format is not None:
                     response = await self._client.chat.completions.create(**call_params)
+                    # Stash usage before parse/validate, which may raise locally
+                    # even though the provider charged for these tokens (#2387).
+                    stash_response_usage(_usage_from_openai_response(response))
 
                     content, first_choice = _content_or_error(
                         response,
@@ -823,6 +923,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         result = response_format.model_validate(json_data)
                 else:
                     response = await self._client.chat.completions.create(**call_params)
+                    stash_response_usage(_usage_from_openai_response(response))
                     result, first_choice = _content_or_error(
                         response,
                         provider=self.provider,
@@ -840,12 +941,23 @@ class OpenAICompatibleLLM(LLMInterface):
                 # Record token usage metrics
                 duration = time.time() - start_time
                 usage = response.usage
-                input_tokens = usage.prompt_tokens or 0 if usage else 0
-                output_tokens = usage.completion_tokens or 0 if usage else 0
+                response_usage = _usage_from_openai_response(response)
+                input_tokens = response_usage.input_tokens
+                output_tokens = response_usage.output_tokens
                 total_tokens = usage.total_tokens or 0 if usage else 0
-                cached_tokens = 0
-                if usage and getattr(usage, "prompt_tokens_details", None):
-                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                cached_tokens = response_usage.cached_tokens
+                thoughts_tokens = 0
+                if usage and getattr(usage, "completion_tokens_details", None):
+                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                # OpenAI-compatible providers fold reasoning tokens into
+                # ``completion_tokens`` (and thus ``total_tokens``), but the
+                # TokenUsage contract — and the Gemini provider — treat
+                # ``output_tokens``/``total_tokens`` as visible-only, surfacing
+                # reasoning separately in ``thoughts_tokens``. Subtract so the
+                # two fields don't double-count reasoning (cost over-attribution).
+                if thoughts_tokens:
+                    output_tokens = max(0, output_tokens - thoughts_tokens)
+                    total_tokens = max(0, total_tokens - thoughts_tokens)
 
                 # Record LLM metrics
                 metrics = get_metrics_collector()
@@ -894,6 +1006,7 @@ class OpenAICompatibleLLM(LLMInterface):
                         output_tokens=output_tokens,
                         total_tokens=total_tokens,
                         cached_tokens=cached_tokens,
+                        thoughts_tokens=thoughts_tokens,
                     )
                     return result, token_usage
                 return result
@@ -1109,6 +1222,7 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
+        self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
         if extra_body:
@@ -1144,6 +1258,17 @@ class OpenAICompatibleLLM(LLMInterface):
                 usage = response.usage
                 input_tokens = usage.prompt_tokens or 0 if usage else 0
                 output_tokens = usage.completion_tokens or 0 if usage else 0
+                cached_tokens = 0
+                if usage and getattr(usage, "prompt_tokens_details", None):
+                    cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0) or 0
+                thoughts_tokens = 0
+                if usage and getattr(usage, "completion_tokens_details", None):
+                    thoughts_tokens = getattr(usage.completion_tokens_details, "reasoning_tokens", 0) or 0
+                # See ``call()``: OpenAI-compatible ``completion_tokens`` includes
+                # reasoning, so make ``output_tokens`` visible-only to avoid
+                # double-counting it against ``thoughts_tokens``.
+                if thoughts_tokens:
+                    output_tokens = max(0, output_tokens - thoughts_tokens)
 
                 metrics = get_metrics_collector()
                 metrics.record_llm_call(
@@ -1186,6 +1311,8 @@ class OpenAICompatibleLLM(LLMInterface):
                     finish_reason=finish_reason,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    thoughts_tokens=thoughts_tokens,
                 )
 
             except APIConnectionError as e:
@@ -1284,9 +1411,10 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Add optional parameters with optimized defaults for Ollama
         options: dict[str, Any] = {
-            "num_ctx": 16384,  # 16k context window for larger prompts
             "num_batch": 512,  # Optimal batch size for prompt processing
         }
+        if self.ollama_num_ctx is not None:
+            options["num_ctx"] = self.ollama_num_ctx
         if max_completion_tokens:
             options["num_predict"] = max_completion_tokens
         if temperature is not None:

@@ -42,7 +42,6 @@ import {
 import {
   Plus,
   Sparkles,
-  Loader2,
   Trash2,
   Eraser,
   RefreshCw,
@@ -57,6 +56,7 @@ import {
   FileText,
   Clock,
 } from "lucide-react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -65,9 +65,11 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { MentalModelDetailModal } from "./mental-model-detail-modal";
+import { ResponseSchemaField } from "./response-schema-field";
 import { TagFilterInput } from "./tag-filter-input";
 import { CronSchedulePreview } from "./cron-schedule-preview";
 import { NextRefresh } from "./next-refresh";
+import { TagChip } from "@/components/ui/facet-chip";
 
 interface ReflectResponseBasedOnFact {
   id: string;
@@ -101,6 +103,8 @@ interface MentalModel {
     include_chunks?: boolean;
     recall_max_tokens?: number;
     recall_chunks_max_tokens?: number;
+    response_schema?: Record<string, unknown>;
+    keep_trace?: boolean;
   };
   last_refreshed_at: string;
   created_at: string;
@@ -159,13 +163,12 @@ export function MentalModelsView() {
       const PAGE_SIZE = 100;
       const all: MentalModel[] = [];
       for (let offset = 0; ; offset += PAGE_SIZE) {
-        const page = await client.listMentalModels(
-          currentBank,
-          selectedTags.length > 0 ? selectedTags : undefined,
-          selectedTags.length > 0 ? tagsMatch : undefined,
-          PAGE_SIZE,
-          offset
-        );
+        const page = await client.listMentalModels(currentBank, {
+          tags: selectedTags.length > 0 ? selectedTags : undefined,
+          tagsMatch: selectedTags.length > 0 ? tagsMatch : undefined,
+          limit: PAGE_SIZE,
+          offset,
+        });
         const items = page.items || [];
         all.push(...items);
         if (items.length < PAGE_SIZE) break;
@@ -283,13 +286,13 @@ export function MentalModelsView() {
     <div>
       {loading ? (
         <div className="text-center py-12">
-          <RefreshCw className="w-8 h-8 mx-auto mb-3 text-muted-foreground animate-spin" />
+          <Spinner size="lg" variant="jump" className="mx-auto mb-3" />
           <p className="text-muted-foreground">{t("loading")}</p>
         </div>
       ) : (
         <>
           {/* Search + tag filter (single row) */}
-          <div className="mb-4 flex items-center gap-3 flex-wrap">
+          <div className="mb-4 flex items-start gap-3 flex-wrap">
             <Input
               type="text"
               value={searchQuery}
@@ -423,12 +426,7 @@ export function MentalModelsView() {
                               {m.tags.length > 0 && (
                                 <div className="flex gap-1">
                                   {m.tags.slice(0, 2).map((tag) => (
-                                    <span
-                                      key={tag}
-                                      className="px-1.5 py-0.5 rounded text-xs bg-blue-500/10 text-blue-600 dark:text-blue-400"
-                                    >
-                                      {tag}
-                                    </span>
+                                    <TagChip key={tag} tag={tag} size="xs" />
                                   ))}
                                   {m.tags.length > 2 && (
                                     <span className="px-1.5 py-0.5 rounded text-xs bg-muted text-muted-foreground">
@@ -562,7 +560,7 @@ export function MentalModelsView() {
               disabled={deleting}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
             >
-              {deleting ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
+              {deleting ? <Spinner size="sm" className="mr-1" /> : null}
               {t("deleteDialogConfirm")}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -586,7 +584,7 @@ export function MentalModelsView() {
           <AlertDialogFooter className="flex-row justify-end space-x-2">
             <AlertDialogCancel className="mt-0">{t("cancelButton")}</AlertDialogCancel>
             <AlertDialogAction onClick={handleClear} disabled={clearing}>
-              {clearing ? <Loader2 className="w-4 h-4 animate-spin mr-1" /> : null}
+              {clearing ? <Spinner size="sm" className="mr-1" /> : null}
               {t("clearDialogConfirm")}
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -715,6 +713,8 @@ function CreateMentalModelDialog({
     includeChunks: "" as "" | "true" | "false",
     recallMaxTokens: "",
     recallChunksMaxTokens: "",
+    responseSchema: "",
+    keepTrace: false,
   });
 
   const handleCreate = async () => {
@@ -754,6 +754,12 @@ function CreateMentalModelDialog({
       const includeChunks =
         form.includeChunks === "true" ? true : form.includeChunks === "false" ? false : undefined;
 
+      // response_schema is only ever set through the schema builder, which
+      // guarantees valid, usable JSON.
+      const responseSchema = form.responseSchema.trim()
+        ? JSON.parse(form.responseSchema.trim())
+        : undefined;
+
       await client.createMentalModel(currentBank, {
         id: form.id.trim() || undefined,
         name: form.name.trim(),
@@ -773,6 +779,8 @@ function CreateMentalModelDialog({
           include_chunks: includeChunks,
           recall_max_tokens: recallMaxTokens,
           recall_chunks_max_tokens: recallChunksMaxTokens,
+          response_schema: responseSchema,
+          keep_trace: form.keepTrace,
         },
       });
 
@@ -793,6 +801,8 @@ function CreateMentalModelDialog({
         includeChunks: "",
         recallMaxTokens: "",
         recallChunksMaxTokens: "",
+        responseSchema: "",
+        keepTrace: false,
       });
       onCreated();
     } catch (error) {
@@ -824,6 +834,8 @@ function CreateMentalModelDialog({
             includeChunks: "",
             recallMaxTokens: "",
             recallChunksMaxTokens: "",
+            responseSchema: "",
+            keepTrace: false,
           });
           onClose();
         }
@@ -1124,6 +1136,30 @@ function CreateMentalModelDialog({
                     {t("optionsRecallChunksMaxTokensDescription")}
                   </p>
                 </div>
+                <ResponseSchemaField
+                  value={form.responseSchema}
+                  onChange={(json) => setForm({ ...form, responseSchema: json })}
+                />
+              </section>
+
+              <section className="space-y-4">
+                <h3 className="text-sm font-semibold text-foreground border-b pb-1">
+                  {t("optionsSectionTroubleshooting")}
+                </h3>
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="create-keep-trace"
+                    checked={form.keepTrace}
+                    onCheckedChange={(checked) => setForm({ ...form, keepTrace: checked === true })}
+                  />
+                  <label
+                    htmlFor="create-keep-trace"
+                    className="text-sm font-medium text-foreground cursor-pointer"
+                  >
+                    {t("optionsKeepTraceLabel")}
+                  </label>
+                </div>
+                <p className="text-xs text-muted-foreground">{t("optionsKeepTraceDescription")}</p>
               </section>
             </TabsContent>
           </div>
@@ -1139,7 +1175,7 @@ function CreateMentalModelDialog({
           >
             {creating ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin mr-1" />
+                <Spinner size="sm" className="mr-1" />
                 {t("creatingButton")}
               </>
             ) : (
@@ -1201,6 +1237,10 @@ function UpdateMentalModelDialog({
       mentalModel.trigger?.recall_chunks_max_tokens != null
         ? String(mentalModel.trigger.recall_chunks_max_tokens)
         : "",
+    responseSchema: mentalModel.trigger?.response_schema
+      ? JSON.stringify(mentalModel.trigger.response_schema, null, 2)
+      : "",
+    keepTrace: mentalModel.trigger?.keep_trace || false,
   });
   const [form, setForm] = useState(buildFormState);
 
@@ -1247,10 +1287,16 @@ function UpdateMentalModelDialog({
       const includeChunks =
         form.includeChunks === "true" ? true : form.includeChunks === "false" ? false : undefined;
 
+      // response_schema is only ever set through the schema builder, which
+      // guarantees valid, usable JSON.
+      const responseSchema = form.responseSchema.trim()
+        ? JSON.parse(form.responseSchema.trim())
+        : undefined;
+
       const updated = await client.updateMentalModel(currentBank, mentalModel.id, {
         name: form.name.trim(),
         source_query: form.sourceQuery.trim(),
-        tags: tags.length > 0 ? tags : undefined,
+        tags,
         max_tokens: maxTokens,
         trigger: {
           mode: form.mode,
@@ -1265,6 +1311,8 @@ function UpdateMentalModelDialog({
           include_chunks: includeChunks,
           recall_max_tokens: recallMaxTokens,
           recall_chunks_max_tokens: recallChunksMaxTokens,
+          response_schema: responseSchema,
+          keep_trace: form.keepTrace,
         },
       });
 
@@ -1570,6 +1618,30 @@ function UpdateMentalModelDialog({
                     {t("optionsRecallChunksMaxTokensDescription")}
                   </p>
                 </div>
+                <ResponseSchemaField
+                  value={form.responseSchema}
+                  onChange={(json) => setForm({ ...form, responseSchema: json })}
+                />
+              </section>
+
+              <section className="space-y-4">
+                <h3 className="text-sm font-semibold text-foreground border-b pb-1">
+                  {t("optionsSectionTroubleshooting")}
+                </h3>
+                <div className="flex items-center space-x-2">
+                  <Checkbox
+                    id="edit-keep-trace"
+                    checked={form.keepTrace}
+                    onCheckedChange={(checked) => setForm({ ...form, keepTrace: checked === true })}
+                  />
+                  <label
+                    htmlFor="edit-keep-trace"
+                    className="text-sm font-medium text-foreground cursor-pointer"
+                  >
+                    {t("optionsKeepTraceLabel")}
+                  </label>
+                </div>
+                <p className="text-xs text-muted-foreground">{t("optionsKeepTraceDescription")}</p>
               </section>
             </TabsContent>
           </div>
@@ -1585,7 +1657,7 @@ function UpdateMentalModelDialog({
           >
             {updating ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin mr-1" />
+                <Spinner size="sm" className="mr-1" />
                 {t("updatingButton")}
               </>
             ) : (
@@ -1701,12 +1773,7 @@ function FilesView({
                     {selected.tags.length > 0 && (
                       <div className="flex gap-1">
                         {selected.tags.map((tag) => (
-                          <span
-                            key={tag}
-                            className="px-2 py-1 rounded-full text-xs bg-muted text-muted-foreground"
-                          >
-                            {tag}
-                          </span>
+                          <TagChip key={tag} tag={tag} />
                         ))}
                       </div>
                     )}

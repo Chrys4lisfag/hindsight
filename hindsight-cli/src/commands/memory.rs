@@ -408,6 +408,7 @@ pub fn reflect(
         tags: if tags.is_empty() { None } else { Some(tags) },
         tags_match: parse_tags_match(&tags_match),
         tag_groups: None,
+        apply_all_directives: false,
         fact_types: mapped_fact_types,
         exclude_mental_models,
         exclude_mental_model_ids,
@@ -470,6 +471,8 @@ pub fn retain(
         items: vec![item],
         async_: r#async,
         document_tags,
+        // The CLI does not expose idempotency keys; each invocation is a new operation.
+        operation_id: None,
     };
 
     let response = client.retain(agent_id, &request, r#async, verbose);

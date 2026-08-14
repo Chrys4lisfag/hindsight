@@ -6,7 +6,8 @@ name: Sync from upstream
 # upstream webhook/workflow to trigger an immediate sync later if desired.
 #
 # Conflict policy: abort the merge, leave main untouched, and open (or update)
-# one issue for manual resolution.
+# one issue for manual resolution. Clean upstream updates are published as the
+# fork's latest standalone Docker image.
 
 on:
   schedule:
@@ -20,10 +21,16 @@ on:
         description: 'Upstream ref to sync'
         required: false
         default: 'main'
+      force_publish_image:
+        description: 'Rebuild latest Docker image even when upstream is unchanged'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   issues: write
+  packages: write
 
 concurrency:
   group: sync-upstream-main
@@ -32,6 +39,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.merge.outputs.updated }}
     env:
       UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
     steps:
@@ -134,3 +143,83 @@ jobs:
         run: |
           echo 'Upstream merge has conflicts; fork main was not changed.'
           exit 1
+
+  publish-image:
+    needs: sync
+    if: needs.sync.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout updated fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image metadata
+        id: image
+        shell: bash
+        run: |
+          owner=${GITHUB_REPOSITORY_OWNER,,}
+          revision=$(git rev-parse HEAD)
+          echo "name=ghcr.io/$owner/hindsight:latest" >> "$GITHUB_OUTPUT"
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "version=0.8.4-fork.${revision:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether image needs publishing
+        id: publish
+        shell: bash
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          UPSTREAM_UPDATED: ${{ needs.sync.outputs.updated }}
+          FORCE_PUBLISH: ${{ inputs.force_publish_image || false }}
+        run: |
+          if [ "$FORCE_PUBLISH" = 'true' ] || [ "$UPSTREAM_UPDATED" = 'true' ]; then
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "$IMAGE" >/dev/null 2>&1; then
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and publish latest fork image
+        if: steps.publish.outputs.needed == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/standalone/Dockerfile
+          target: standalone
+          pull: true
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.image.outputs.name }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.image.outputs.revision }}
+            org.opencontainers.image.version=${{ steps.image.outputs.version }}
+
+      - name: Report existing image
+        if: steps.publish.outputs.needed == 'false'
+        run: echo 'Fork latest image already exists; build skipped.'

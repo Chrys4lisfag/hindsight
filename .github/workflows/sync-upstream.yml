@@ -1,23 +1,23 @@
-name: Sync from upstream + rebase patches
+name: Sync from upstream
 
-# Pulls main from upstream vectorize-io/hindsight, rebases our patch
-# commits on top, pushes the result. Runs daily and on manual dispatch.
+# Pulls vectorize-io/hindsight into this fork. GitHub cannot directly trigger
+# workflows in a fork when the upstream repository receives a push, so the
+# schedule polls upstream every two hours. repository_dispatch allows an
+# upstream webhook/workflow to trigger an immediate sync later if desired.
 #
-# Conflict policy: if rebase fails (e.g. upstream rewrote gemini_llm.py
-# in a way that conflicts with our HttpOptions patch), the workflow
-# aborts the rebase and opens an issue tagged `merge-conflict` for
-# manual resolution. We never auto-resolve to avoid silently dropping
-# the patch.
+# Conflict policy: abort the merge, leave main untouched, and open (or update)
+# one issue for manual resolution.
 
 on:
   schedule:
-    # Daily at 03:17 UTC. Off-peak relative to typical upstream merge
-    # windows; staggered minute to avoid GitHub's top-of-hour load.
-    - cron: '17 3 * * *'
+    # Staggered minute avoids GitHub's top-of-hour scheduler load.
+    - cron: '17 */2 * * *'
+  repository_dispatch:
+    types: [upstream-push]
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: 'Upstream ref to sync (default: main)'
+        description: 'Upstream ref to sync'
         required: false
         default: 'main'
 
@@ -25,13 +25,20 @@ permissions:
   contents: write
   issues: write
 
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
     steps:
-      - name: Checkout fork (full history)
+      - name: Checkout fork main (full history)
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -40,81 +47,90 @@ jobs:
           git config user.name 'sync-bot'
           git config user.email 'sync-bot@users.noreply.github.com'
 
-      - name: Add upstream remote
+      - name: Fetch upstream
         run: |
           git remote add upstream https://github.com/vectorize-io/hindsight.git
-          git fetch upstream
+          git fetch --no-tags upstream "$UPSTREAM_REF"
 
-      - name: Rebase fork main onto upstream main
-        id: rebase
+      - name: Merge upstream into fork
+        id: merge
+        shell: bash
         run: |
-          UPSTREAM_REF='${{ github.event.inputs.upstream_ref || ''main'' }}'
-          echo "Rebasing onto upstream/${UPSTREAM_REF}"
-          git checkout main
-          # Try rebase. If it fails, capture state for the issue body.
-          if git rebase "upstream/${UPSTREAM_REF}"; then
-            echo "result=clean" >> $GITHUB_OUTPUT
+          before=$(git rev-parse HEAD)
+
+          if git merge --no-edit FETCH_HEAD; then
+            echo "result=clean" >> "$GITHUB_OUTPUT"
+            if [ "$(git rev-parse HEAD)" = "$before" ]; then
+              echo "updated=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+            fi
           else
-            echo "result=conflict" >> $GITHUB_OUTPUT
-            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+            conflicts=$(git diff --name-only --diff-filter=U)
             {
               echo 'conflicts<<EOF'
-              echo "$CONFLICTS"
+              echo "$conflicts"
               echo 'EOF'
-            } >> $GITHUB_OUTPUT
-            git rebase --abort
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
           fi
 
-      - name: Push (force-with-lease) on clean rebase
-        if: steps.rebase.outputs.result == 'clean'
-        run: |
-          # Only push if there's anything new to push.
-          if [ -n "$(git log --oneline 'origin/main..HEAD')" ]; then
-            git push --force-with-lease origin main
-            echo 'Pushed updated main.'
-          else
-            echo 'Already up-to-date; nothing to push.'
-          fi
+      - name: Push clean merge
+        if: steps.merge.outputs.result == 'clean' && steps.merge.outputs.updated == 'true'
+        run: git push origin main
 
-      - name: Open issue on conflict
-        if: steps.rebase.outputs.result == 'conflict'
+      - name: Report no changes
+        if: steps.merge.outputs.result == 'clean' && steps.merge.outputs.updated == 'false'
+        run: echo 'Fork already up to date.'
+
+      - name: Open or update conflict issue
+        if: steps.merge.outputs.result == 'conflict'
         uses: actions/github-script@v7
+        env:
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const conflicts = `${{ steps.rebase.outputs.conflicts }}`;
+            const { owner, repo } = context.repo;
+            const title = 'Upstream sync conflict';
+            const conflicts = process.env.CONFLICTS || '(no list captured)';
             const body = [
-              '## Upstream sync conflict',
+              'Scheduled merge from `vectorize-io/hindsight` could not be applied cleanly.',
               '',
-              'The scheduled rebase from `vectorize-io/hindsight:main` could not be applied cleanly.',
+              `Upstream ref: \`${process.env.UPSTREAM_REF}\``,
               '',
               '### Conflicting files',
               '```',
-              conflicts || '(no list captured)',
+              conflicts,
               '```',
               '',
-              '### How to resolve',
+              'Resolve manually, then close this issue. The sync workflow will retry automatically.',
               '',
-              '1. `git fetch upstream`',
-              '2. `git checkout main`',
-              '3. `git rebase upstream/main`',
-              '4. Resolve conflicts manually — pay attention to `hindsight-api-slim/hindsight_api/engine/providers/gemini_llm.py` where the `HttpOptions` patch lives.',
-              '5. `git push --force-with-lease origin main`',
-              '',
-              '_Auto-opened by `.github/workflows/sync-upstream.yml`._',
+              `_Last attempt: ${new Date().toISOString()}_`,
             ].join('\n');
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `Upstream sync conflict (${new Date().toISOString().split('T')[0]})`,
-              body,
-              labels: ['merge-conflict', 'sync-upstream'],
-            });
 
-      - name: Summary
+            const openIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              { owner, repo, state: 'open', per_page: 100 },
+            );
+            const existing = openIssues.find(
+              issue => !issue.pull_request && issue.title === title,
+            );
+
+            if (existing) {
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }
+
+      - name: Fail on merge conflict
+        if: steps.merge.outputs.result == 'conflict'
         run: |
-          echo "Rebase result: ${{ steps.rebase.outputs.result }}"
-          if [ "${{ steps.rebase.outputs.result }}" = "conflict" ]; then
-            echo 'Conflicting files:'
-            echo "${{ steps.rebase.outputs.conflicts }}"
-          fi
+          echo 'Upstream merge has conflicts; fork main was not changed.'
+          exit 1

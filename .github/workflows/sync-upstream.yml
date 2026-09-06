@@ -44,12 +44,16 @@ jobs:
     env:
       UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
     steps:
+      # SYNC_TOKEN is a PAT with the `workflow` scope. GITHUB_TOKEN can never push
+      # changes under .github/workflows/**, and upstream updates those files often —
+      # without the PAT the push is rejected and no sync ever lands. Falls back to
+      # GITHUB_TOKEN so the merge/report path still runs if the secret is missing.
       - name: Checkout fork main (full history)
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Configure git identity
         run: |

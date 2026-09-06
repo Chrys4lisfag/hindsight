@@ -74,16 +74,39 @@ jobs:
             else
               echo "updated=true" >> "$GITHUB_OUTPUT"
             fi
-          else
-            echo "result=conflict" >> "$GITHUB_OUTPUT"
-            conflicts=$(git diff --name-only --diff-filter=U)
-            {
-              echo 'conflicts<<EOF'
-              echo "$conflicts"
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-            git merge --abort
+            exit 0
           fi
+
+          conflicts=$(git diff --name-only --diff-filter=U)
+
+          # .github/star-history/* are generated artifacts: star-history.yml rewrites them
+          # on this fork AND upstream, so they collide on every single sync. Taking the
+          # upstream copy loses nothing — our own scheduled run regenerates the chart.
+          # Anything outside that allowlist is still a real conflict and is never touched.
+          unexpected=$(printf '%s\n' "$conflicts" | grep -v '^\.github/star-history/' || true)
+          if [ -n "$conflicts" ] && [ -z "$unexpected" ]; then
+            resolved=1
+            for path in $conflicts; do
+              if ! git checkout --theirs -- "$path" || ! git add -- "$path"; then
+                resolved=0
+                break
+              fi
+            done
+            if [ "$resolved" = 1 ] && git commit --no-edit; then
+              echo "Auto-resolved generated star-history conflicts to the upstream copy."
+              echo "result=clean" >> "$GITHUB_OUTPUT"
+              echo "updated=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "result=conflict" >> "$GITHUB_OUTPUT"
+          {
+            echo 'conflicts<<EOF'
+            echo "$conflicts"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          git merge --abort
 
       - name: Push clean merge
         if: steps.merge.outputs.result == 'clean' && steps.merge.outputs.updated == 'true'
@@ -119,23 +142,33 @@ jobs:
               `_Last attempt: ${new Date().toISOString()}_`,
             ].join('\n');
 
-            const openIssues = await github.paginate(
-              github.rest.issues.listForRepo,
-              { owner, repo, state: 'open', per_page: 100 },
-            );
-            const existing = openIssues.find(
-              issue => !issue.pull_request && issue.title === title,
-            );
+            try {
+              const openIssues = await github.paginate(
+                github.rest.issues.listForRepo,
+                { owner, repo, state: 'open', per_page: 100 },
+              );
+              const existing = openIssues.find(
+                issue => !issue.pull_request && issue.title === title,
+              );
 
-            if (existing) {
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number: existing.number,
-                body,
-              });
-            } else {
-              await github.rest.issues.create({ owner, repo, title, body });
+              if (existing) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: existing.number,
+                  body,
+                });
+              } else {
+                await github.rest.issues.create({ owner, repo, title, body });
+              }
+            } catch (error) {
+              // Issues may be disabled on this fork (410 Gone). The conflict still has to be
+              // visible, but a disabled tracker must not mask it behind an API failure.
+              if (![403, 404, 410].includes(error.status)) throw error;
+              core.warning(
+                `Could not file a conflict issue (status ${error.status}); reporting in the job summary instead.`,
+              );
+              await core.summary.addHeading('Upstream sync conflict').addRaw(body).write();
             }
 
       - name: Fail on merge conflict
